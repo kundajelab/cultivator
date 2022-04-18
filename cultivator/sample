@@ -1,0 +1,213 @@
+#!/usr/bin/env python
+# sample
+
+# Author: Jacob Schreiber <jmschreiber91@gmail.com>
+
+import pandas
+import numpy
+import random
+import math
+import argparse
+import pyBigWig
+
+from tqdm import tqdm
+from tqdm import trange
+
+def parse_args():
+    parser=argparse.ArgumentParser(description="Sample GC-matched negatives genome-wide.")
+    parser.add_argument("-p", "--peaks", required=True, help="Peak bed file.")
+    parser.add_argument("-b", "--bigwig", required=True, help="GC content bigwig.")
+    parser.add_argument("-o", "--output", required=True, help="Output bed file.")
+    parser.add_argument("-l", "--bin_width", type=float, default=0.2, help="GC bin width to match.")
+    parser.add_argument("-w", "--width", type=int, default=2114, help="Width for calculating GC content.")
+    parser.add_argument("-v", "--verbose", action='store_true')
+    return parser.parse_args()
+
+def extract_values_and_masks(bed, bw, width, verbose=False):
+	"""Extract the average signal value for each entry in a bed file.
+
+	This function takes in a bed file as a pandas DataFrame, a bigwig file
+	as a pyBigWig object, and a fixed width. Importantly, this bigwig file
+	must be precomputed rolling averages along that width instead of the
+	underlying signal. Hence, the value that is reported is the value in the
+	middle of each entry in the bed file, which will be the precomputed
+	rolling average.
+
+	Binary masks are also returned for each chromosome marking where these
+	loci are so that they cannot be selected in the next stage.
+
+	Parameters
+	----------
+	bed: pandas.DataFrame
+		A set of coordinates for which to extract values
+
+	bw: pyBigWig file
+		A signal file with precomputed rolling averages at each position.
+
+	width: int
+		The width to mark in the binary masks for each selected example.
+
+	verbose: bool, optional
+		Whether to have a progress bar as examples are selected. Default is
+		False.
+
+	Returns
+	-------
+	values: numpy.ndarray
+		A 1-D array of signal values in the same order as the bed file.
+
+	masks: dict
+		A dictionary of binary masks where the keys are the chromosome names
+		and the values are numpy arrays that span the chromosome length.
+	"""
+
+	values = []
+	chroms = bw.chroms()
+
+	masks = {}
+	for chrom, size in chroms.items():
+		masks[chrom] = numpy.zeros(size, dtype=bool)
+
+	for _, (chrom, start, end) in tqdm(bed.iterrows(), disable=not verbose, total=len(bed)):
+		if chrom not in chroms:
+			continue
+
+		if start < width:
+			start, end = 0, width * 2
+		elif end > chroms[chrom] - width:
+			start, end = chroms[chrom] - width * 2, chroms[chrom]
+		else:
+			mid = (end - start) // 2 + start
+			start, end = mid - width, mid + width
+
+		mid = (end - start) // 2 + start
+		masks[chrom][start:end] = True
+
+		signal = bw.values(chrom, mid, mid+1, numpy=True)[0]
+		values.append(signal)
+
+	return numpy.array(values), masks
+
+def extract_matching_reservoirs(bw, value_bin, value_bin_counts, bin_width, verbose=False):
+	"""Extract non-overlapping, matching, regions genome-wide.
+
+	Given a genome-wide rolling average signal bigwig and a count for the
+	number of loci to select at each signal bin, extract candidate regions
+	from each chromosome. Importantly, this function will attempt to extract
+	the total desired number of loci from each chromosome to ensure that
+	at least those numbers are extracted genome-wide. For example, if 10 loci
+	are requested at a signal bin of 0.2 and 15 are requested at 0.4, this
+	number will be extracted from each chromosome. 
+
+	Parameters
+	----------
+	bw: pyBigWig file
+		A signal file with precomputed rolling averages at each position.
+
+	value_bin: list or numpy.ndarray
+		The binned values to sample
+
+	value_bin_counts: list or numpy.ndarray
+		The number of each bin, in the same order as value_bin, to select.
+
+	bin_width: float
+		The width for which to bin signal when finding matches.
+
+	verbose: bool, optional
+		Whether to have a progress bar as examples are selected. Default is
+		False.
+
+	Returns
+	-------
+	reservoirs: dict
+		A dictionary of candidate matching regions where the keys are GC bins
+		and the entries are a subset of total indices, non-overlapping across
+		bins.
+	"""
+
+	reservoirs = {value: [] for value in value_bin}
+
+	for chrom, length in bw.chroms().items():
+		X = bw.values(chrom, 0, -1, numpy=True)
+		X = numpy.nan_to_num(X)
+		X = ((X + bin_width / 2) // bin_width).astype(int)
+		X[masks[chrom]] = -1
+
+		for value, count in zip(value_bin, value_bin_counts):
+			idxs = numpy.where(X == value)[0]
+			numpy.random.shuffle(idxs)
+			n_selected = 0
+
+			if verbose:
+				print("Attempting to select {} loci...".format(count))
+
+			desc = "{} {}".format(chrom, value * bin_width)
+			for idx in tqdm(idxs, desc=desc, disable=not verbose):
+				if X[idx] == -1:
+					continue
+
+				reservoirs[value].append((chrom, idx, length))
+				X[idx-width:idx+width] = -1
+
+				n_selected += 1
+				if n_selected == count:
+					break
+
+	return reservoirs
+
+if __name__ == '__main__':
+	# Extract the arguments
+	args = parse_args()
+
+	peak_filename = args.peaks
+	bigwig_filename = args.bigwig
+	bed_filename = args.output
+
+	width = args.width
+	bin_width = args.bin_width
+	verbose = args.verbose
+
+	# Load the peak file and signal bigwig
+	names = 'chrom', 'start', 'end'
+	bed = pandas.read_csv(peak_filename, delimiter="\t", usecols=(0, 1, 2), names=names) #.iloc[:10000]
+	bw = pyBigWig.open(bigwig_filename, "r")
+
+	# Extract GC content from the given peaks and bin it
+	values, masks = extract_values_and_masks(bed, bw, width, verbose=True)
+	values = ((values + bin_width / 2) // bin_width).astype(int)
+	value_bin, value_bin_counts = numpy.unique(values, return_counts=True)
+
+	# Extract regions that match the GC content of the peaks
+	reservoirs = extract_matching_reservoirs(bw, value_bin, value_bin_counts, bin_width, verbose)
+
+	# In case there aren't enough for each bin, 
+	n_to_select_from = [len(reservoirs[value]) for value in value_bin]
+	n_to_select = [count for count in value_bin_counts]
+
+	for i in range(len(value_bin)-1):
+		k = max(0, n_to_select[i] - n_to_select_from[i])
+		n_to_select[i+1] += k
+		n_to_select[i] -= k
+
+		k = max(0, n_to_select[-i-1] - n_to_select_from[-i-1])
+		n_to_select[-i-2] += k
+		n_to_select[-i-1] -= k
+
+
+	chosen_idxs = []
+	for i, (value, count) in enumerate(zip(value_bin, n_to_select)):
+		if count == 0:
+			continue
+
+		weights = numpy.array([idx[2] for idx in reservoirs[value]], dtype='float64')
+		weights = weights / weights.sum()
+
+		r_idxs = numpy.random.choice(len(weights), size=count, replace=False, p=weights)
+		entries = [reservoirs[value][idx] for idx in r_idxs]
+		chosen_idxs.extend(entries)
+
+	with open(bed_filename, "w") as outfile:
+		for chrom, mid, _ in chosen_idxs:
+			start, end = mid - width // 2, mid + width // 2
+			outfile.write("{}\t{}\t{}\n".format(chrom, int(start), int(end)))
+
