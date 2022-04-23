@@ -3,15 +3,16 @@
 
 # Author: Jacob Schreiber <jmschreiber91@gmail.com>
 
-import pandas
-import numpy
-import random
 import math
+import numpy
+import pandas
+import random
 import argparse
 import pyBigWig
 
 from tqdm import tqdm
 from tqdm import trange
+from scipy.stats import rankdata
 
 def parse_args():
     parser=argparse.ArgumentParser(description="Sample GC-matched negatives genome-wide.")
@@ -167,6 +168,8 @@ if __name__ == '__main__':
 	bin_width = args.bin_width
 	verbose = args.verbose
 
+	numpy.random.seed(0)
+
 	# Load the peak file and signal bigwig
 	names = 'chrom', 'start', 'end'
 	bed = pandas.read_csv(peak_filename, delimiter="\t", usecols=(0, 1, 2), names=names) #.iloc[:10000]
@@ -193,8 +196,7 @@ if __name__ == '__main__':
 		n_to_select[-i-2] += k
 		n_to_select[-i-1] -= k
 
-
-	chosen_idxs = []
+	chosen_idxs, chosen_values = {}, []
 	for i, (value, count) in enumerate(zip(value_bin, n_to_select)):
 		if count == 0:
 			continue
@@ -203,11 +205,17 @@ if __name__ == '__main__':
 		weights = weights / weights.sum()
 
 		r_idxs = numpy.random.choice(len(weights), size=count, replace=False, p=weights)
-		entries = [reservoirs[value][idx] for idx in r_idxs]
-		chosen_idxs.extend(entries)
+		
+		chosen_idxs[value] = [reservoirs[value][idx] for idx in r_idxs]
+		chosen_values.extend([value] * count)
+
+	values_idxs = rankdata(values, method="ordinal") - 1
+	chosen_values = sorted(chosen_values)
 
 	with open(bed_filename, "w") as outfile:
-		for chrom, mid, _ in chosen_idxs:
+		for i, (value, value_idx) in enumerate(zip(values, values_idxs)):
+			matched_value = chosen_values[value_idx]
+			chrom, mid, _ = chosen_idxs[matched_value].pop(0)
 			start, end = mid - width // 2, mid + width // 2
 			outfile.write("{}\t{}\t{}\n".format(chrom, int(start), int(end)))
 
